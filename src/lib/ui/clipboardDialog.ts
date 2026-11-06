@@ -619,12 +619,19 @@ export class ClipboardDialog extends Clutter.Actor {
 		item.connectObject(
 			'open-menu',
 			(_: unknown, x: number, y: number, w: number, h: number) => {
-				// Connect the menu signal to update the hover state of the item and remove the signal when the menu is closed
-				const signalId = this._clipboardItemMenu.connect('open-state-changed', (_menu, state: boolean) => {
-					item.sync_hover();
-					if (!state) this._clipboardItemMenu.disconnect(signalId);
-					return true;
-				});
+				// Connect the menu signal to update the hover state of the item and remove the signal when the menu
+				// is closed. The item owns the connection, so it is also removed when the item is destroyed (items
+				// are destroyed when the list is rebuilt), which prevents syncing the hover state of a dead widget.
+				this._clipboardItemMenu.disconnectObject(item);
+				this._clipboardItemMenu.connectObject(
+					'open-state-changed',
+					(_menu: unknown, state: boolean) => {
+						item.sync_hover();
+						if (!state) this._clipboardItemMenu.disconnectObject(item);
+						return true;
+					},
+					item,
+				);
 
 				this._clipboardItemMenu.arrowAlignment = w === 0 && h === 0 ? 0 : 0.5;
 
