@@ -25,6 +25,7 @@ import { ClipboardScrollView } from './clipboardScrollView.js';
 import { ClipboardItemMenu } from './components/clipboardItemMenu.js';
 import { ConfirmClearHistoryDialog } from './indicator.js';
 import { CharacterItem } from './items/characterItem.js';
+import { ClipboardItem } from './items/clipboardItem.js';
 import { CodeItem } from './items/codeItem.js';
 import { ColorItem } from './items/colorItem.js';
 import { FileItem } from './items/fileItem.js';
@@ -329,6 +330,7 @@ export class ClipboardDialog extends Clutter.Actor {
 
 		// Scrollbox
 		this._scrollView = new ClipboardScrollView(ext);
+		this._scrollView.setItemFactory((entry) => this.createItem(entry));
 		this._dialog.add_child(this._scrollView);
 
 		this._widthConstraint = new Clutter.BindConstraint({
@@ -542,7 +544,35 @@ export class ClipboardDialog extends Clutter.Actor {
 		});
 	}
 
+	private static readonly SUPPORTED_TYPES: ReadonlySet<ItemType> = new Set([
+		ItemType.Text,
+		ItemType.Code,
+		ItemType.Image,
+		ItemType.File,
+		ItemType.Files,
+		ItemType.Link,
+		ItemType.Character,
+		ItemType.Color,
+	]);
+
 	public addEntry(entry: ClipboardEntry): void {
+		if (!this.isSupported(entry)) return;
+		this._scrollView.addEntry(entry);
+	}
+
+	// Unknown types are rejected on entry, since they can only be detected when a widget is created
+	private isSupported(entry: ClipboardEntry): boolean {
+		if (ClipboardDialog.SUPPORTED_TYPES.has(entry.type)) return true;
+
+		this.ext.logger.error('Unknown item type', entry);
+		return false;
+	}
+
+	/**
+	 * Creates the widget for an entry. Called by the scroll container every time an entry needs a widget, which
+	 * can happen more than once per entry since widgets are created progressively.
+	 */
+	private createItem(entry: ClipboardEntry): ClipboardItem | null {
 		let item;
 		try {
 			item = (() => {
@@ -570,11 +600,11 @@ export class ClipboardDialog extends Clutter.Actor {
 
 			if (!item) {
 				this.ext.logger.error('Unknown item type', entry);
-				return;
+				return null;
 			}
 		} catch (e) {
 			this.ext.logger.error(e);
-			return;
+			return null;
 		}
 
 		// Connect edit
@@ -631,7 +661,7 @@ export class ClipboardDialog extends Clutter.Actor {
 			this,
 		);
 
-		this._scrollView.addItem(item);
+		return item;
 	}
 
 	public dialogShortcut() {

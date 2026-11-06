@@ -4,9 +4,8 @@ import St from 'gi://St';
 
 import type CopyousExtension from '../../extension.js';
 import { enumParamSpec, registerClass } from '../common/gjs.js';
-import { get_first_visible_child, get_last_visible_child } from '../misc/actor.js';
-import { ClipboardScrollContainer } from './clipboardScrollContainer.js';
-import { ClipboardItem } from './items/clipboardItem.js';
+import type { ClipboardEntry } from '../database/database.js';
+import { ClipboardItemFactory, ClipboardScrollContainer } from './clipboardScrollContainer.js';
 import { SearchQuery } from './searchEntry.js';
 
 @registerClass({
@@ -45,6 +44,7 @@ export class ClipboardScrollView extends St.ScrollView {
 
 		this._scrollContainer = new ClipboardScrollContainer(ext);
 		this.set_child(this._scrollContainer);
+		this._scrollContainer.attachAdjustments();
 
 		this.connect('notify::width', this.scrollbarWorkaround.bind(this));
 		this._scrollContainer.connect('notify::width', this.scrollbarWorkaround.bind(this));
@@ -78,8 +78,16 @@ export class ClipboardScrollView extends St.ScrollView {
 		this.updateScrollbar();
 	}
 
-	public addItem(item: ClipboardItem) {
-		this._scrollContainer.addItem(item);
+	public setItemFactory(factory: ClipboardItemFactory) {
+		this._scrollContainer.setItemFactory(factory);
+	}
+
+	public addEntry(entry: ClipboardEntry) {
+		this._scrollContainer.addEntry(entry);
+	}
+
+	public addEntries(entries: ClipboardEntry[]) {
+		this._scrollContainer.addEntries(entries);
 	}
 
 	public clearItems() {
@@ -139,19 +147,13 @@ export class ClipboardScrollView extends St.ScrollView {
 
 		// Home
 		if (key === Clutter.KEY_Home) {
-			const child = get_first_visible_child(this._scrollContainer);
-			if (child) {
-				this._scrollContainer.focusChild(child);
-			}
+			this._scrollContainer.focusFirst();
 			return Clutter.EVENT_STOP;
 		}
 
 		// End
 		if (key === Clutter.KEY_End) {
-			const child = get_last_visible_child(this._scrollContainer);
-			if (child) {
-				this._scrollContainer.focusChild(child);
-			}
+			this._scrollContainer.focusLast();
 			return Clutter.EVENT_STOP;
 		}
 
