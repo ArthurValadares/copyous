@@ -303,7 +303,9 @@ export class ClipboardItem extends St.Button {
 		const maxHeight = theme.get_max_height();
 
 		const [, nat] = this._box.get_preferred_height(for_width);
-		const height = Math.min(nat + border, maxHeight);
+
+		// get_max_height() is -1 when the theme does not define one
+		const height = maxHeight >= 0 ? Math.min(nat + border, maxHeight) : nat + border;
 		return [height, height];
 	}
 
