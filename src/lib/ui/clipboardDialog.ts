@@ -560,6 +560,11 @@ export class ClipboardDialog extends Clutter.Actor {
 		this._scrollView.addEntry(entry);
 	}
 
+	/** Adds many entries at once. Preferred over calling addEntry in a loop. */
+	public addEntries(entries: ClipboardEntry[]): void {
+		this._scrollView.addEntries(entries.filter((entry) => this.isSupported(entry)));
+	}
+
 	// Unknown types are rejected on entry, since they can only be detected when a widget is created
 	private isSupported(entry: ClipboardEntry): boolean {
 		if (ClipboardDialog.SUPPORTED_TYPES.has(entry.type)) return true;
