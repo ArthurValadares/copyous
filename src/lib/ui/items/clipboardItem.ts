@@ -37,6 +37,10 @@ export class ClipboardItem extends St.Button {
 	private readonly _header: ClipboardItemHeader;
 	protected _content: St.BoxLayout;
 
+	// Bindings to objects that outlive this item. They are not released by destroying the widgets (only by the
+	// garbage collector), so they are unbound explicitly. Items are created and destroyed while scrolling.
+	private _bindings: GObject.Binding[] = [];
+
 	constructor(
 		protected ext: CopyousExtension,
 		readonly entry: ClipboardEntry,
@@ -76,19 +80,21 @@ export class ClipboardItem extends St.Button {
 		this._box.add_child(this._content);
 
 		// Bind properties
-		entry.bind_property(
-			'pinned',
-			this._header,
-			'pinned',
-			GObject.BindingFlags.BIDIRECTIONAL | GObject.BindingFlags.SYNC_CREATE,
-		);
-		entry.bind_property('datetime', this._header, 'datetime', GObject.BindingFlags.SYNC_CREATE);
-		entry.bind_property('tag', this._header, 'tag', GObject.BindingFlags.SYNC_CREATE);
-		entry.bind_property(
-			'title',
-			this._header,
-			'custom-title',
-			GObject.BindingFlags.BIDIRECTIONAL | GObject.BindingFlags.SYNC_CREATE,
+		this._bindings.push(
+			entry.bind_property(
+				'pinned',
+				this._header,
+				'pinned',
+				GObject.BindingFlags.BIDIRECTIONAL | GObject.BindingFlags.SYNC_CREATE,
+			),
+			entry.bind_property('datetime', this._header, 'datetime', GObject.BindingFlags.SYNC_CREATE),
+			entry.bind_property('tag', this._header, 'tag', GObject.BindingFlags.SYNC_CREATE),
+			entry.bind_property(
+				'title',
+				this._header,
+				'custom-title',
+				GObject.BindingFlags.BIDIRECTIONAL | GObject.BindingFlags.SYNC_CREATE,
+			),
 		);
 
 		// prettier-ignore
@@ -105,13 +111,16 @@ export class ClipboardItem extends St.Button {
 			'changed::header-controls-visibility', this.updateHeader.bind(this),
 			this);
 
+		// Both ends of this binding are owned by this item
 		this.bind_property('active', this._header, 'active', GObject.BindingFlags.SYNC_CREATE);
-		this.ext.shortcutsManager?.bind_property(
+
+		const shiftBinding = this.ext.shortcutsManager?.bind_property(
 			'shift',
 			this._header,
 			'force-delete',
 			GObject.BindingFlags.SYNC_CREATE,
 		);
+		if (shiftBinding) this._bindings.push(shiftBinding);
 
 		this.updateSize();
 		this.updateProtection();
@@ -300,6 +309,9 @@ export class ClipboardItem extends St.Button {
 
 	override destroy() {
 		this.ext.settings.disconnectObject(this);
+
+		for (const binding of this._bindings) binding.unbind();
+		this._bindings = [];
 
 		super.destroy();
 	}
