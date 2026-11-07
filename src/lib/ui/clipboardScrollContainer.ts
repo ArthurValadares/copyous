@@ -724,6 +724,8 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 		if (this._scrollId !== 0) GLib.source_remove(this._scrollId);
 		this._scrollId = 0;
 
+		for (const entry of this._entries) entry.disconnectObject(this);
+
 		super.destroy();
 	}
 }
