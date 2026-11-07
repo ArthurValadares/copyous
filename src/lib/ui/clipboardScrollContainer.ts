@@ -9,11 +9,17 @@ import { ClipboardItem } from './items/clipboardItem.js';
 import { State, StatusItem } from './items/statusItem.js';
 import { SearchChange, SearchQuery } from './searchEntry.js';
 
-/** Number of items created synchronously whenever the list is (re)built. */
+/** Number of widgets created synchronously whenever the list is rebuilt. */
 const INITIAL = 20;
 
-/** Number of items created per idle iteration while the scroll position approaches the end of the list. */
-const BATCH = 10;
+/** Widgets are created at least this many pages ahead of the visible area while scrolling. */
+const AHEAD_PAGES = 3;
+
+/** Time budget (µs) of one slice of widget creation when the scroll position is close to the last created widget. */
+const URGENT_BUDGET_US = 8000;
+
+/** Time budget (µs) of one slice of widget creation when filling the list in the background. */
+const BACKGROUND_BUDGET_US = 3000;
 
 /** Creates the widget for an entry. Returns null if the entry cannot be displayed. */
 export type ClipboardItemFactory = (entry: ClipboardEntry) => ClipboardItem | null;
@@ -21,10 +27,16 @@ export type ClipboardItemFactory = (entry: ClipboardEntry) => ClipboardItem | nu
 /**
  * A scrollable list of clipboard items that creates its widgets progressively.
  *
- * All entries (the model) are always kept in memory, but a ClipboardItem widget is only created for the first
- * `_shown` entries that match the search. More are created when the scroll position gets within one page of the
- * end. Position, spacing and size of the widgets are entirely handled by the St.BoxLayout: nothing here depends
- * on the item size, the orientation, the text direction or the margins defined by the theme.
+ * All entries (the model) are always kept in memory, but a ClipboardItem is only created for the first `_shown`
+ * entries that match the search. Position, spacing and size of the widgets are entirely handled by the
+ * St.BoxLayout: nothing here depends on the item size, the orientation, the text direction or the margins defined
+ * by the theme.
+ *
+ * Widgets are created by a single "pump", in slices limited by a time budget so that no frame is blocked for long:
+ * - The first INITIAL widgets are created synchronously (when the list changes), so the dialog opens quickly.
+ * - After the dialog has been opened once, the rest is created in the background, in small slices at low priority.
+ * - When the scroll position gets within AHEAD_PAGES pages of the last created widget, the pump runs at a higher
+ *   priority and with a larger budget, so it stays ahead of the scrolling.
  */
 @registerClass()
 export class ClipboardScrollContainer extends St.BoxLayout {
@@ -37,10 +49,18 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 	private _filtered: ClipboardEntry[] = []; // entries matching the search, newest first
 	private readonly _indexOf = new Map<ClipboardEntry, number>(); // index in _filtered
 
-	// Widgets: always the first `_shown` entries of _filtered
+	// Widgets. Invariant: the children of this container (apart from the status item) are the widgets of the first
+	// `_shown` entries of _filtered, in order.
 	private readonly _live = new Map<ClipboardEntry, ClipboardItem>();
 	private _shown: number = 0;
-	private _moreId: number = 0;
+	private _firstItem: ClipboardItem | null = null; // the only item with the first-child pseudo-class
+	private _lastItem: ClipboardItem | null = null; // the only item with the last-child pseudo-class
+
+	// Pump
+	private _filling: boolean = false; // whether the list is completed in the background
+	private _pumpId: number = 0;
+	private _pumpUrgent: boolean = false;
+	private _settleUpper: number | null = null; // scroll range at the time widgets were created, until it is laid out
 	private _scrollId: number = 0;
 
 	private _lastFocus: ClipboardEntry | null = null;
@@ -54,10 +74,10 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 		});
 
 		this._statusItem = new StatusItem(ext);
-		this.reconcile();
+		this.refresh();
 
 		// The scroll direction changes the adjustment that has to be watched
-		this.connectObject('notify::orientation', () => this.scheduleMore(), this);
+		this.connectObject('notify::orientation', () => this.schedulePump(), this);
 	}
 
 	/**
@@ -68,9 +88,9 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 		for (const adjustment of [this.hadjustment, this.vadjustment]) {
 			// prettier-ignore
 			adjustment.connectObject(
-				'notify::value', () => this.scheduleMore(),
-				'notify::upper', () => this.scheduleMore(),
-				'notify::page-size', () => this.scheduleMore(),
+				'notify::value', () => this.schedulePump(),
+				'notify::upper', () => this.schedulePump(),
+				'notify::page-size', () => this.schedulePump(),
 				this);
 		}
 	}
@@ -92,7 +112,7 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 		this.registerEntry(entry);
 		this._entries.splice(this.insertionIndex(entry), 0, entry);
 		if (this._lastQuery) this.applyQuery(entry, this._lastQuery);
-		this.refresh(false);
+		this.refresh();
 	}
 
 	/** Adds many entries with a single sort and a single update of the widgets. */
@@ -106,7 +126,7 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 		}
 
 		this._entries.sort((a, b) => b.datetime.compare(a.datetime));
-		this.refresh(true);
+		this.refresh();
 	}
 
 	public removeEntry(entry: ClipboardEntry): void {
@@ -116,7 +136,7 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 		const hadFocus = this.focusedEntry() === entry;
 
 		this.dropEntry(entry);
-		this.refresh(false);
+		this.refresh();
 
 		if (hadFocus) {
 			const next = index !== undefined ? this.neighbor(index) : null;
@@ -138,7 +158,7 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 		this._entries = [];
 		this._matched.clear();
 		this._lastFocus = null;
-		this.refresh(true);
+		this.refresh();
 
 		if (hadFocus) {
 			// Navigate to the search entry
@@ -182,7 +202,7 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 
 		this._entries.splice(i, 1);
 		this._entries.splice(this.insertionIndex(entry), 0, entry);
-		this.refresh(false);
+		this.refresh();
 	}
 
 	private applyQuery(entry: ClipboardEntry, query: SearchQuery): void {
@@ -200,63 +220,49 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 
 	/**
 	 * Recomputes the matching entries from the model and brings the widgets up to date.
-	 * @param reset Whether the window of created widgets is reset to its initial size (e.g. after a new search).
+	 *
+	 * The window of widgets is the first INITIAL entries, the run of widgets that already exist right after them
+	 * (so a more specific search or a new entry does not rebuild widgets that still fit) and the focused entry.
+	 * Widgets outside of the window are destroyed, missing widgets inside of it are created synchronously.
 	 */
-	private refresh(reset: boolean): void {
+	private refresh(): void {
 		const focused = this.focusedEntry();
 
 		this._filtered = this._entries.filter((e) => this._matched.get(e) !== false);
 		this._indexOf.clear();
 		this._filtered.forEach((e, i) => this._indexOf.set(e, i));
 
-		let shown = reset ? INITIAL : Math.max(this._shown, INITIAL);
+		const n = this._filtered.length;
+		let limit = Math.min(INITIAL, n);
+		while (limit < n && this._live.has(this._filtered[limit]!)) limit++;
 
 		// The focused item (e.g. while editing its title) must keep existing
-		const focusIndex = focused ? this._indexOf.get(focused) : undefined;
-		if (focusIndex !== undefined) shown = Math.max(shown, focusIndex + 1);
+		const focusIndex = focused !== null ? this._indexOf.get(focused) : undefined;
+		if (focusIndex !== undefined) limit = Math.max(limit, focusIndex + 1);
 
-		this._shown = Math.min(shown, this._filtered.length);
-		this.reconcile();
-		this.scheduleMore();
-	}
-
-	/** Creates the widgets for the first `count` matching entries, if they do not exist yet. */
-	private reveal(count: number): void {
-		count = Math.min(count, this._filtered.length);
-		if (count <= this._shown) return;
-
-		this._shown = count;
-		this.reconcile();
-	}
-
-	/** Makes the children of this container exactly the widgets of the first `_shown` matching entries, in order. */
-	private reconcile(): void {
-		const wanted = this._filtered.slice(0, this._shown);
+		const wanted = this._filtered.slice(0, limit);
 		const wantedSet = new Set(wanted);
 
-		// Destroy widgets that are no longer part of the window
 		for (const [entry, item] of [...this._live]) {
-			if (!wantedSet.has(entry)) {
-				this._live.delete(entry);
-				item.destroy();
-			}
+			if (!wantedSet.has(entry)) this.destroyItem(entry, item);
 		}
 
 		if (this._statusItem.get_parent() === this) this.remove_child(this._statusItem);
 
-		// Create missing widgets
 		const items: ClipboardItem[] = [];
 		const failed: ClipboardEntry[] = [];
+		let created = false;
 		for (const entry of wanted) {
 			let item = this._live.get(entry);
 			if (!item) {
-				item = this._itemFactory?.(entry) ?? undefined;
-				if (!item) {
+				const newItem = this.createWidget(entry);
+				if (!newItem) {
 					failed.push(entry);
 					continue;
 				}
 
-				this._live.set(entry, item);
+				item = newItem;
+				created = true;
 				this.add_child(item);
 			}
 			items.push(item);
@@ -265,7 +271,7 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 		// Entries that could not be turned into a widget are dropped from the model
 		if (failed.length > 0) {
 			for (const entry of failed) this.dropEntry(entry);
-			this.refresh(false);
+			this.refresh();
 			return;
 		}
 
@@ -274,20 +280,81 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 			if (this.get_child_at_index(i) !== item) this.set_child_at_index(item, i);
 		});
 
-		// Only change pseudo-classes that differ, since every change restyles and relayouts the item.
-		// The last child only is the last item of the list once every matching entry has a widget, otherwise
-		// the end margin of the theme would show up in the middle of the list.
-		const complete = this._shown >= this._filtered.length;
-		items.forEach((item, i) => {
-			this.setPseudoClass(item, 'first-child', i === 0);
-			this.setPseudoClass(item, 'last-child', complete && i === items.length - 1);
-		});
-
-		this.updateStatus(items.length);
+		this._shown = items.length;
+		this.updateEdges();
+		this.updateStatus();
+		if (created) this.markPending();
+		this.schedulePump();
 	}
 
-	private updateStatus(count: number): void {
-		if (count === 0) {
+	/** Creates the widgets of the next entries, up to `limit` entries in total, stopping once `deadline` is passed. */
+	private extend(limit: number, deadline: number = Infinity): void {
+		limit = Math.min(limit, this._filtered.length);
+
+		let created = 0;
+		while (this._shown < limit) {
+			// Always create at least one widget, so that every slice makes progress
+			if (created > 0 && GLib.get_monotonic_time() >= deadline) break;
+
+			const entry = this._filtered[this._shown]!;
+			const item = this.createWidget(entry);
+			if (!item) {
+				// The entry cannot be displayed. The widgets of the entries before it are not affected.
+				this.dropEntry(entry);
+				this.refresh();
+				return;
+			}
+
+			// New widgets always come after the existing ones, which are in order
+			this.add_child(item);
+			this._shown++;
+			created++;
+		}
+
+		if (created === 0) return;
+
+		this.updateEdges();
+		this.markPending();
+	}
+
+	private createWidget(entry: ClipboardEntry): ClipboardItem | null {
+		const item = this._itemFactory?.(entry) ?? null;
+		if (item) this._live.set(entry, item);
+		return item;
+	}
+
+	private destroyItem(entry: ClipboardEntry, item: ClipboardItem): void {
+		this._live.delete(entry);
+		if (item === this._firstItem) this._firstItem = null;
+		if (item === this._lastItem) this._lastItem = null;
+		item.destroy();
+	}
+
+	/**
+	 * Only the first widget has the first-child pseudo-class. Only the last widget of the *complete* list has the
+	 * last-child pseudo-class, otherwise the end margin of the theme would show up in the middle of the list.
+	 * Only changes pseudo-classes that differ, since every change restyles and relayouts the item.
+	 */
+	private updateEdges(): void {
+		const complete = this._shown >= this._filtered.length;
+		const first = this._shown > 0 ? (this._live.get(this._filtered[0]!) ?? null) : null;
+		const last = this._shown > 0 && complete ? (this._live.get(this._filtered[this._shown - 1]!) ?? null) : null;
+
+		if (first !== this._firstItem) {
+			this._firstItem?.remove_style_pseudo_class('first-child');
+			first?.add_style_pseudo_class('first-child');
+			this._firstItem = first;
+		}
+
+		if (last !== this._lastItem) {
+			this._lastItem?.remove_style_pseudo_class('last-child');
+			last?.add_style_pseudo_class('last-child');
+			this._lastItem = last;
+		}
+	}
+
+	private updateStatus(): void {
+		if (this._shown === 0) {
 			this.add_child(this._statusItem);
 			this.x_align = Clutter.ActorAlign.CENTER;
 			this.x_expand = true;
@@ -299,43 +366,67 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 		}
 	}
 
-	private setPseudoClass(widget: St.Widget, name: string, on: boolean): void {
-		if (widget.has_style_pseudo_class(name) === on) return;
-		if (on) widget.add_style_pseudo_class(name);
-		else widget.remove_style_pseudo_class(name);
-	}
-
 	// ---------------------------------------------------------------------------------------------------------------
-	// Progressive loading
+	// Pump
 	// ---------------------------------------------------------------------------------------------------------------
 
 	private get adjustment(): St.Adjustment {
 		return this.orientation === Clutter.Orientation.HORIZONTAL ? this.hadjustment : this.vadjustment;
 	}
 
-	/** Whether there are entries without a widget less than one page away from the visible area. */
-	private needsMore(): boolean {
-		if (this._shown >= this._filtered.length) return false;
-
-		// Not allocated yet: the initial batch is enough until the first layout reports a size
-		const adjustment = this.adjustment;
-		if (adjustment.page_size <= 0) return false;
-
-		return adjustment.upper - (adjustment.value + adjustment.page_size) < adjustment.page_size;
+	/** Remembers that widgets were created whose size is not part of the scroll range yet. */
+	private markPending(): void {
+		this._settleUpper = this.adjustment.upper;
 	}
 
 	/**
-	 * Creates the next batch in an idle callback, never inside a scroll or layout event. Only one batch is created
-	 * at a time: its layout changes `upper`, which schedules the next batch if more are still needed.
+	 * Whether the scroll position is within AHEAD_PAGES pages of the last created widget.
+	 *
+	 * The scroll range only includes new widgets after the next layout. Until then the range is stale and the
+	 * position would look closer to the end than it is, so the pump is not considered urgent. This never blocks
+	 * the pump, it only keeps it at the background budget until the range is up to date.
 	 */
-	private scheduleMore(): void {
-		if (this._moreId !== 0 || !this.needsMore()) return;
+	private isUrgent(): boolean {
+		if (this._shown >= this._filtered.length) return false;
 
-		this._moreId = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
-			this._moreId = 0;
-			if (this.needsMore()) this.reveal(this._shown + BATCH);
+		const adjustment = this.adjustment;
+		if (adjustment.page_size <= 0) return false;
+
+		if (this._settleUpper !== null) {
+			if (adjustment.upper === this._settleUpper) return false;
+			this._settleUpper = null;
+		}
+
+		return adjustment.upper - (adjustment.value + adjustment.page_size) < adjustment.page_size * AHEAD_PAGES;
+	}
+
+	/**
+	 * Makes sure a slice of widget creation is scheduled, in an idle callback and never inside a scroll or layout
+	 * event. At most one is pending. A pending background slice is replaced when scrolling makes it urgent.
+	 */
+	private schedulePump(): void {
+		if (!this._filling || this._shown >= this._filtered.length) return;
+
+		const urgent = this.isUrgent();
+		if (this._pumpId !== 0) {
+			if (!urgent || this._pumpUrgent) return;
+			GLib.source_remove(this._pumpId);
+		}
+
+		this._pumpUrgent = urgent;
+		this._pumpId = GLib.idle_add(urgent ? GLib.PRIORITY_DEFAULT_IDLE : GLib.PRIORITY_LOW, () => {
+			this._pumpId = 0;
+			this.pump();
 			return GLib.SOURCE_REMOVE;
 		});
+	}
+
+	private pump(): void {
+		if (this._shown >= this._filtered.length) return;
+
+		const budget = this.isUrgent() ? URGENT_BUDGET_US : BACKGROUND_BUDGET_US;
+		this.extend(this._filtered.length, GLib.get_monotonic_time() + budget);
+		this.schedulePump();
 	}
 
 	// ---------------------------------------------------------------------------------------------------------------
@@ -368,7 +459,7 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 		if (index === undefined) return;
 
 		const created = index >= this._shown;
-		this.reveal(index + 1);
+		this.extend(index + 1);
 		const item = this._live.get(entry);
 		if (!item) return;
 
@@ -477,7 +568,7 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 
 		// Only the data is searched, widgets that are still needed are reused
 		for (const entry of this._entries) this.applyQuery(entry, query);
-		this.refresh(true);
+		this.refresh();
 
 		if (focused !== null && this._indexOf.has(focused)) {
 			this.focusEntry(focused, false);
@@ -504,7 +595,7 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 		const index = this._indexOf.get(entry);
 		const hadFocus = this.focusedEntry() === entry;
 
-		this.refresh(false);
+		this.refresh();
 
 		if (hadFocus && !after) {
 			const next = index !== undefined ? this.neighbor(index) : null;
@@ -517,7 +608,7 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 		const first = this._filtered[0];
 		if (!first) return;
 
-		this.reveal(1);
+		this.extend(1);
 		const item = this._live.get(first);
 		if (item instanceof St.Button) {
 			item.vfunc_clicked(1);
@@ -620,12 +711,16 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 		this.vadjustment.value = 0;
 
 		super.vfunc_map();
-		this.scheduleMore();
+
+		// The rest of the list is created in the background from the first time the dialog is opened. Until then
+		// only the initial widgets exist, which keeps the start of the shell light.
+		this._filling = true;
+		this.schedulePump();
 	}
 
 	override destroy(): void {
-		if (this._moreId !== 0) GLib.source_remove(this._moreId);
-		this._moreId = 0;
+		if (this._pumpId !== 0) GLib.source_remove(this._pumpId);
+		this._pumpId = 0;
 		if (this._scrollId !== 0) GLib.source_remove(this._scrollId);
 		this._scrollId = 0;
 
