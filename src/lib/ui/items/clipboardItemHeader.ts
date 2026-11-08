@@ -92,6 +92,7 @@ export class ClipboardItemHeader extends St.BoxLayout {
 	private _customTitle: string = '';
 	private _defaultTitle: string = '';
 	private _isEditing: boolean = false;
+	private _pinned: boolean = false;
 
 	private readonly _headerIcon: St.Icon;
 	private readonly _headerContent: St.BoxLayout;
@@ -99,14 +100,20 @@ export class ClipboardItemHeader extends St.BoxLayout {
 	private _titleEntry: St.Entry | null = null;
 	private readonly _timeLabel: TimeLabel;
 	public buttons: St.BoxLayout;
-	private readonly _deleteButton: St.Button;
-	private readonly _menuButton: St.Button;
-	private readonly _pinButton: St.Button;
-	private readonly _tagIcon: St.Bin;
+	// The buttons are only created once they are needed (controls visible, pinned or tagged), since most items
+	// never show them when the controls are only visible on hover or hidden.
+	private _deleteButton: St.Button | null = null;
+	private _menuButton: St.Button | null = null;
+	private _pinButton: St.Button | null = null;
+	private _tagIcon: St.Bin | null = null;
 	private _clickCount: number = 0;
 	private _lastClickTime: number = 0;
 
-	constructor(ext: Extension, icon: Icon, title: string) {
+	constructor(
+		private readonly ext: Extension,
+		icon: Icon,
+		title: string,
+	) {
 		super({
 			style_class: 'clipboard-item-header',
 			y_align: Clutter.ActorAlign.START,
@@ -180,44 +187,56 @@ export class ClipboardItemHeader extends St.BoxLayout {
 			x_expand: true,
 		});
 		this.add_child(this.buttons);
+	}
 
-		this._menuButton = new St.Button({
+	/** Creates the buttons, in the order they are shown in. */
+	private ensureButtons() {
+		if (this._menuButton) return;
+
+		const menuButton = new St.Button({
 			style_class: 'clipboard-item-header-button menu-button',
 			y_align: Clutter.ActorAlign.CENTER,
-			child: new St.Icon({ gicon: loadIcon(ext, Icon.ViewMore) }),
+			child: new St.Icon({ gicon: loadIcon(this.ext, Icon.ViewMore) }),
 		});
-		this._menuButton.connect('clicked', () => {
-			const box = this._menuButton.get_transformed_extents();
+		menuButton.connect('clicked', () => {
+			const box = menuButton.get_transformed_extents();
 			this.emit('open-menu', box.get_x(), box.get_y(), box.get_width(), box.get_height());
 		});
-		this.buttons.add_child(this._menuButton);
+		this.buttons.add_child(menuButton);
 
-		this._deleteButton = new St.Button({
+		const deleteButton = new St.Button({
 			style_class: 'clipboard-item-header-button',
 			y_align: Clutter.ActorAlign.CENTER,
-			child: new St.Icon({ gicon: loadIcon(ext, Icon.Delete) }),
+			child: new St.Icon({ gicon: loadIcon(this.ext, Icon.Delete) }),
 		});
-		this._deleteButton.connect('clicked', () => this.emit('delete'));
-		this.buttons.add_child(this._deleteButton);
+		deleteButton.connect('clicked', () => this.emit('delete'));
+		this.buttons.add_child(deleteButton);
 
-		this._pinButton = new St.Button({
+		const pinButton = new St.Button({
 			style_class: 'clipboard-item-header-button',
 			y_align: Clutter.ActorAlign.CENTER,
 			toggle_mode: true,
-			child: new St.Icon({ gicon: loadIcon(ext, Icon.Pin) }),
+			checked: this._pinned,
+			child: new St.Icon({ gicon: loadIcon(this.ext, Icon.Pin) }),
 		});
-		this.buttons.add_child(this._pinButton);
+		// The user toggled the button
+		pinButton.connect('notify::checked', () => {
+			if (this._pinned !== pinButton.checked) this.pinned = pinButton.checked;
+		});
+		this.buttons.add_child(pinButton);
 
-		this._tagIcon = new St.Bin({
+		const tagIcon = new St.Bin({
 			style_class: 'clipboard-item-tag-button',
 			y_align: Clutter.ActorAlign.CENTER,
 			visible: false,
-			child: new St.Icon({ gicon: loadIcon(ext, Icon.Tag) }),
+			child: new St.Icon({ gicon: loadIcon(this.ext, Icon.Tag) }),
 		});
-		this.buttons.add_child(this._tagIcon);
+		this.buttons.add_child(tagIcon);
 
-		// Bind properties
-		this.bind_property('pinned', this._pinButton, 'checked', GObject.BindingFlags.BIDIRECTIONAL);
+		this._menuButton = menuButton;
+		this._deleteButton = deleteButton;
+		this._pinButton = pinButton;
+		this._tagIcon = tagIcon;
 	}
 
 	get isEditing() {
@@ -225,11 +244,14 @@ export class ClipboardItemHeader extends St.BoxLayout {
 	}
 
 	get pinned() {
-		return this._pinButton.checked;
+		return this._pinned;
 	}
 
 	set pinned(pinned) {
-		this._pinButton.checked = pinned;
+		if (this._pinned === pinned) return;
+
+		this._pinned = pinned;
+		if (this._pinButton && this._pinButton.checked !== pinned) this._pinButton.checked = pinned;
 		this.updateHeaderControls();
 		this.notify('pinned');
 	}
@@ -447,9 +469,16 @@ export class ClipboardItemHeader extends St.BoxLayout {
 			deleteVisible = false;
 		}
 
-		this._pinButton.visible = visible || this.pinned;
-		this._menuButton.visible = visible;
-		this._deleteButton.visible = visible && deleteVisible;
-		this._tagIcon.visible = this._tag !== null && !this._pinButton.visible;
+		const pinVisible = visible || this.pinned;
+		if (!this._menuButton) {
+			// Nothing to show: leave the buttons for later
+			if (!pinVisible && this._tag === null) return;
+			this.ensureButtons();
+		}
+
+		this._pinButton!.visible = pinVisible;
+		this._menuButton!.visible = visible;
+		this._deleteButton!.visible = visible && deleteVisible;
+		this._tagIcon!.visible = this._tag !== null && !pinVisible;
 	}
 }

@@ -37,6 +37,10 @@ export class ClipboardItem extends St.Button {
 	private readonly _header: ClipboardItemHeader;
 	protected _content: St.BoxLayout;
 
+	// Last value announced with notify::active. Hover, focus and style change often (every restyle emits
+	// style-changed), but the header and the previews only need to know when the value really changes.
+	private _lastActive: ActiveState = ActiveState.None;
+
 	// Bindings to objects that outlive this item. They are not released by destroying the widgets (only by the
 	// garbage collector), so they are unbound explicitly. Items are created and destroyed while scrolling.
 	private _bindings: GObject.Binding[] = [];
@@ -68,6 +72,10 @@ export class ClipboardItem extends St.Button {
 
 		this._header = new ClipboardItemHeader(ext, icon, title);
 		this._box.add_child(this._header);
+
+		// Before anything that updates the header controls, so that the header does not create its buttons for the
+		// default visibility when the setting says they are not shown
+		this._header.controlsVisibility = this.ext.settings.get_enum('header-controls-visibility');
 
 		this._content = new St.BoxLayout({
 			style_class: 'clipboard-item-content',
@@ -128,8 +136,8 @@ export class ClipboardItem extends St.Button {
 		this.updateHeader();
 
 		// Connect signals
-		this.connect('notify::hover', () => this.notify('active'));
-		this.connect('style-changed', () => this.notify('active'));
+		this.connect('notify::hover', () => this.updateActive());
+		this.connect('style-changed', () => this.updateActive());
 		this._header.connect('delete', () => this.forceDelete());
 		this._header.connect('open-menu', (_, x, y, w, h) => this.emit('open-menu', x, y, w, h));
 		this._header.connect('editing-finished', () => this.grab_key_focus());
@@ -141,6 +149,15 @@ export class ClipboardItem extends St.Button {
 		const hover = +this.hover * ActiveState.Hover;
 		const active = +(this.get_style_pseudo_class()?.includes('active') ?? false) * ActiveState.Active;
 		return (focus | hover | active) as ActiveState;
+	}
+
+	/** Emits notify::active only if the state changed since the last notification. */
+	private updateActive(): void {
+		const active = this.active;
+		if (active === this._lastActive) return;
+
+		this._lastActive = active;
+		this.notify('active');
 	}
 
 	public search(query: SearchQuery) {
@@ -238,12 +255,12 @@ export class ClipboardItem extends St.Button {
 
 	override vfunc_key_focus_in(): void {
 		super.vfunc_key_focus_in();
-		this.notify('active');
+		this.updateActive();
 	}
 
 	override vfunc_key_focus_out(): void {
 		super.vfunc_key_focus_out();
-		this.notify('active');
+		this.updateActive();
 	}
 
 	override vfunc_key_press_event(event: Clutter.Event): boolean {

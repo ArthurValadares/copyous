@@ -8,6 +8,7 @@ import type CopyousExtension from '../../../extension.js';
 import { registerClass } from '../../common/gjs.js';
 import { CustomColorScheme } from '../../common/settings.js';
 import { Language } from '../../database/database.js';
+import { LruCache } from '../../misc/asyncCache.js';
 import { normalizeIndentation, trim } from './label.js';
 
 // https://gitlab.gnome.org/GNOME/gtksourceview/-/blob/master/data/styles/Adwaita-dark.xml
@@ -199,6 +200,23 @@ const Light = {
 	'deletion': { fgcolor: 'red_1' },
 };
 
+/**
+ * Only this many lines are highlighted and shown. Items have a limited height, so the rest is never visible, and
+ * highlighting (especially the automatic language detection) is by far the most expensive part of an item.
+ */
+const MAX_LINES = 200;
+
+/** Highlighted markup of code that was already highlighted, since items are destroyed and created while scrolling. */
+const highlightCache = new LruCache<string, { markup: string; detected: Language | null }>(128);
+
+/** The properties that CodeLabel handles itself. They must not reach the St.Label constructor. */
+function labelProps(
+	props: Partial<St.Label.ConstructorProps & CodeLabelConstructorProps>,
+): Partial<St.Label.ConstructorProps> {
+	const { code, language, syntaxHighlighting, showLineNumbers, tabWidth, ...rest } = props;
+	return rest;
+}
+
 export interface CodeLabelConstructorProps {
 	code: string;
 	language: Language | null;
@@ -263,12 +281,13 @@ export class CodeLabel extends St.Label {
 	private _showLineNumbers = true;
 
 	private _highlighted: string = '';
+	private _destroyed: boolean = false;
 
 	public constructor(
 		private ext: CopyousExtension,
 		props: Partial<St.Label.ConstructorProps & CodeLabelConstructorProps>,
 	) {
-		super({ ...props, min_height: 0, clip_to_allocation: true });
+		super({ ...labelProps(props), min_height: 0, clip_to_allocation: true });
 		this.clutter_text.line_wrap_mode = Pango.WrapMode.WORD_CHAR;
 		this.clutter_text.ellipsize = Pango.EllipsizeMode.END;
 
@@ -297,6 +316,9 @@ export class CodeLabel extends St.Label {
 	}
 
 	override destroy(): void {
+		// Callbacks that are still registered (the one of connectHljsInit cannot be removed) must do nothing
+		this._destroyed = true;
+
 		if (this._colorSchemeChangedId >= 0) {
 			this.ext.themeManager?.disconnect(this._colorSchemeChangedId);
 		}
@@ -360,23 +382,52 @@ export class CodeLabel extends St.Label {
 	}
 
 	private updateText() {
-		if (this._code == null) return;
+		if (this._code == null || this._destroyed) return;
 
 		// Trim indentation before highlighting to prevent empty lines
 		let text = normalizeIndentation(trim(this._code), this.tabWidth);
-		if (this.syntaxHighlighting && this.ext.hljs != null) {
-			const language =
-				this.language && this.ext.hljs.getLanguage(this.language.id) != null ? this.language.id : null;
 
-			const result = language ? this.ext.hljs.highlight(text, { language }) : this.ext.hljs.highlightAuto(text);
-			text = applyTheme(this.ext.themeManager?.colorScheme, result.value);
+		// Only the lines that can be visible
+		let end = -1;
+		for (let i = 0; i < MAX_LINES; i++) {
+			end = text.indexOf('\n', end + 1);
+			if (end === -1) break;
+		}
+		if (end !== -1) text = text.substring(0, end);
+
+		const hljs = this.ext.hljs;
+		if (this.syntaxHighlighting && hljs != null) {
+			const language = this.language && hljs.getLanguage(this.language.id) != null ? this.language.id : null;
+			const scheme = this.ext.themeManager?.colorScheme;
+
+			// The result depends on the text, the language, the color scheme and the registered languages
+			const key = [
+				GLib.compute_checksum_for_string(GLib.ChecksumType.SHA1, text, -1),
+				language ?? '',
+				scheme ?? '',
+				hljs.listLanguages().length,
+			].join(':');
+
+			let entry = highlightCache.get(key);
+			if (!entry) {
+				const result = language ? hljs.highlight(text, { language }) : hljs.highlightAuto(text);
+
+				let detected: Language | null = null;
+				if (!language && result.language) {
+					const id = result.language;
+					const name = hljs.getLanguage(id)?.name ?? id;
+					detected = { id, name: id.length < name.length - 3 ? id.charAt(0) + id.slice(1) : name };
+				}
+
+				entry = { markup: applyTheme(scheme, result.value), detected };
+				highlightCache.set(key, entry);
+			}
+
+			text = entry.markup;
 
 			// Store language
-			if (!language && result.language) {
-				const id = result.language;
-				const name = this.ext.hljs.getLanguage(id)?.name ?? id;
-
-				this._language = { id, name: id.length < name.length - 3 ? id.charAt(0) + id.slice(1) : name };
+			if (entry.detected) {
+				this._language = entry.detected;
 				this.notify('language');
 			}
 		} else {
