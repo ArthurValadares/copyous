@@ -1,3 +1,4 @@
+import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
 
 // Every cache, so that they can be released together when the extension is disabled
@@ -96,7 +97,94 @@ export class AsyncCache<K, V> {
 	}
 }
 
-/** Releases everything held by the caches. Call this when the extension is disabled. */
+export interface IdleHandle {
+	cancel(): void;
+}
+
+/** Time budget (µs) of one slice of the idle queue. */
+const IDLE_BUDGET_US = 4000;
+
+interface IdleTask {
+	fn: (() => void) | null;
+}
+
+/**
+ * Runs deferred work (such as building the heavy content of an item) in slices limited by a time budget, in idle
+ * callbacks, oldest task first. This does not add parallelism, the work still runs in the main thread, but it keeps
+ * any single frame short. A task that was cancelled never runs.
+ */
+class IdleQueue {
+	private _tasks: IdleTask[] = [];
+	private _head: number = 0;
+	private _sourceId: number = 0;
+
+	enqueue(fn: () => void): IdleHandle {
+		const task: IdleTask = { fn };
+		this._tasks.push(task);
+		this.schedule();
+		return {
+			cancel: () => {
+				task.fn = null;
+			},
+		};
+	}
+
+	private schedule(): void {
+		if (this._sourceId !== 0) return;
+
+		this._sourceId = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+			this._sourceId = 0;
+			this.run();
+			return GLib.SOURCE_REMOVE;
+		});
+	}
+
+	private run(): void {
+		const deadline = GLib.get_monotonic_time() + IDLE_BUDGET_US;
+
+		let ran = 0;
+		while (this._head < this._tasks.length) {
+			// Always run at least one task, so that every slice makes progress
+			if (ran > 0 && GLib.get_monotonic_time() >= deadline) break;
+
+			const task = this._tasks[this._head++]!;
+			const fn = task.fn;
+			task.fn = null;
+			if (!fn) continue;
+
+			ran++;
+			try {
+				fn();
+			} catch (e) {
+				console.error('Copyous: deferred task failed', e);
+			}
+		}
+
+		if (this._head >= this._tasks.length) {
+			this._tasks = [];
+			this._head = 0;
+		} else {
+			// Drop the tasks that are done
+			if (this._head > 64) {
+				this._tasks = this._tasks.slice(this._head);
+				this._head = 0;
+			}
+			this.schedule();
+		}
+	}
+
+	clear(): void {
+		if (this._sourceId !== 0) GLib.source_remove(this._sourceId);
+		this._sourceId = 0;
+		this._tasks = [];
+		this._head = 0;
+	}
+}
+
+export const idleQueue = new IdleQueue();
+
+/** Releases everything held by the caches and the idle queue. Call this when the extension is disabled. */
 export function clearAsyncCaches(): void {
+	idleQueue.clear();
 	for (const cache of caches) cache.clear();
 }

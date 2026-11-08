@@ -1,3 +1,4 @@
+import Clutter from 'gi://Clutter';
 import GObject from 'gi://GObject';
 import Gio from 'gi://Gio';
 
@@ -8,6 +9,7 @@ import { registerClass } from '../../common/gjs.js';
 import { Icon } from '../../common/icons.js';
 import { ImageItemSettings } from '../../common/settings.js';
 import { ClipboardEntry } from '../../database/database.js';
+import { type IdleHandle, idleQueue } from '../../misc/asyncCache.js';
 import { ContentInfo, createFileInfo } from '../components/contentInfo.js';
 import { FileType, ImagePreview } from '../components/contentPreview.js';
 import { SearchQuery } from '../searchEntry.js';
@@ -29,8 +31,10 @@ export class ImageItem extends ClipboardItem {
 
 	private _showImageInfo: boolean = false;
 
-	private readonly _imagePreview: ImagePreview;
+	// Created in a deferred idle task, so that creating the item does not start loading the image
+	private _imagePreview?: ImagePreview;
 	private _imageInfo?: ContentInfo;
+	private _deferred: IdleHandle | undefined = undefined;
 
 	private readonly _cancellable: Gio.Cancellable = new Gio.Cancellable();
 
@@ -42,10 +46,6 @@ export class ImageItem extends ClipboardItem {
 		this.add_style_class_name('image-item');
 		this.add_style_class_name('no-image-info');
 
-		const file = Gio.File.new_for_uri(entry.content);
-		this._imagePreview = new ImagePreview(ext, file);
-		this._content.add_child(this._imagePreview);
-
 		// Bind properties
 		this.imageItemSettings.connectObject(
 			'changed::show-image-info',
@@ -55,10 +55,34 @@ export class ImageItem extends ClipboardItem {
 			this,
 		);
 
+		// With a dynamic height the size of the item depends on its content, so the content is not deferred
+		const dynamicHeight = this.ext.settings.get_boolean('dynamic-item-height');
+		const orientation: Clutter.Orientation = this.ext.settings.get_enum('clipboard-orientation');
+		if (dynamicHeight && orientation === Clutter.Orientation.VERTICAL) {
+			this.buildPreview();
+		} else {
+			this._deferred = idleQueue.enqueue(() => {
+				this._deferred = undefined;
+				this.buildPreview();
+			});
+		}
+
 		this.updateSettings();
+	}
+
+	private buildPreview() {
+		if (this._imagePreview) return;
+
+		const file = Gio.File.new_for_uri(this.entry.content);
+		const preview = new ImagePreview(this.ext, file);
+		this._imagePreview = preview;
+
+		// Before the image info, if that exists
+		this._content.insert_child_at_index(preview, 0);
+		preview.backgroundSize = this.imageItemSettings.get_enum('background-size');
 
 		// Hover effect
-		this.bind_property('active', this._imagePreview, 'active', GObject.BindingFlags.DEFAULT);
+		this.bind_property('active', preview, 'active', GObject.BindingFlags.DEFAULT);
 	}
 
 	get showImageInfo() {
@@ -79,7 +103,7 @@ export class ImageItem extends ClipboardItem {
 
 	private updateSettings() {
 		this.showImageInfo = this.imageItemSettings.get_boolean('show-image-info');
-		this._imagePreview.backgroundSize = this.imageItemSettings.get_enum('background-size');
+		if (this._imagePreview) this._imagePreview.backgroundSize = this.imageItemSettings.get_enum('background-size');
 	}
 
 	private configureImageInfo() {
@@ -111,6 +135,9 @@ export class ImageItem extends ClipboardItem {
 	}
 
 	override destroy() {
+		this._deferred?.cancel();
+		this._deferred = undefined;
+
 		this.imageItemSettings.disconnectObject(this);
 		this._cancellable.cancel();
 
