@@ -88,6 +88,12 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 
 		// The scroll direction changes the adjustment that has to be watched
 		this.connectObject('notify::orientation', () => this.schedulePump(), this);
+
+		// prettier-ignore
+		this._ext.settings.connectObject(
+			'changed::item-width', () => this.resizeHolders(),
+			'changed::item-height', () => this.resizeHolders(),
+			this);
 	}
 
 	/**
@@ -247,6 +253,13 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 			width: this._ext.settings.get_int('item-width'),
 			height: this._ext.settings.get_int('item-height'),
 		});
+	}
+
+	private resizeHolders(): void {
+		const width = this._ext.settings.get_int('item-width');
+		const height = this._ext.settings.get_int('item-height');
+		for (const holder of this._holders.values()) holder.set_size(width, height);
+		this.schedulePump();
 	}
 
 	/**
@@ -937,6 +950,7 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 		if (this._scrollId !== 0) GLib.source_remove(this._scrollId);
 		this._scrollId = 0;
 
+		this._ext.settings.disconnectObject(this);
 		for (const entry of this._entries) entry.disconnectObject(this);
 
 		super.destroy();
