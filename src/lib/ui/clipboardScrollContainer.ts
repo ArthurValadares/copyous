@@ -27,7 +27,7 @@ export type ClipboardItemFactory = (entry: ClipboardEntry) => ClipboardItem | nu
 /**
  * A scrollable list of clipboard items that creates its widgets progressively.
  *
- * All entries (the model) are always kept in memory, but a ClipboardItem is only created for the first `_shown`
+ * All entries (the model) are always kept in memory, but a ClipboardItem is only created for the first `_count`
  * entries that match the search. Position, spacing and size of the widgets are entirely handled by the
  * St.BoxLayout: nothing here depends on the item size, the orientation, the text direction or the margins defined
  * by the theme.
@@ -49,12 +49,13 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 	private _filtered: ClipboardEntry[] = []; // entries matching the search, newest first
 	private readonly _indexOf = new Map<ClipboardEntry, number>(); // index in _filtered
 
-	// Widgets. Invariant: the children of this container (apart from the status item) are the widgets of the first
-	// `_shown` entries of _filtered, in order.
+	// Widgets. Invariant: the children of this container (apart from the status item) are, in order, the widgets of
+	// the first `_count` entries of _filtered. Each one is either in _live (real item) or in _holders (placeholder).
 	private readonly _live = new Map<ClipboardEntry, ClipboardItem>();
-	private _shown: number = 0;
-	private _firstItem: ClipboardItem | null = null; // the only item with the first-child pseudo-class
-	private _lastItem: ClipboardItem | null = null; // the only item with the last-child pseudo-class
+	private readonly _holders = new Map<ClipboardEntry, St.Widget>();
+	private _count: number = 0;
+	private _firstWidget: St.Widget | null = null; // the only widget with the first-child pseudo-class
+	private _lastWidget: St.Widget | null = null; // the only widget with the last-child pseudo-class
 
 	// Pump
 	private _filling: boolean = false; // whether the list is completed in the background
@@ -244,7 +245,7 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 		const wantedSet = new Set(wanted);
 
 		for (const [entry, item] of [...this._live]) {
-			if (!wantedSet.has(entry)) this.destroyItem(entry, item);
+			if (!wantedSet.has(entry)) this.destroyWidget(entry, item);
 		}
 
 		if (this._statusItem.get_parent() === this) this.remove_child(this._statusItem);
@@ -280,7 +281,7 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 			if (this.get_child_at_index(i) !== item) this.set_child_at_index(item, i);
 		});
 
-		this._shown = items.length;
+		this._count = items.length;
 		this.updateEdges();
 		this.updateStatus();
 		if (created) this.markPending();
@@ -292,11 +293,11 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 		limit = Math.min(limit, this._filtered.length);
 
 		let created = 0;
-		while (this._shown < limit) {
+		while (this._count < limit) {
 			// Always create at least one widget, so that every slice makes progress
 			if (created > 0 && GLib.get_monotonic_time() >= deadline) break;
 
-			const entry = this._filtered[this._shown]!;
+			const entry = this._filtered[this._count]!;
 			const item = this.createWidget(entry);
 			if (!item) {
 				// The entry cannot be displayed. The widgets of the entries before it are not affected.
@@ -307,7 +308,7 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 
 			// New widgets always come after the existing ones, which are in order
 			this.add_child(item);
-			this._shown++;
+			this._count++;
 			created++;
 		}
 
@@ -323,38 +324,44 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 		return item;
 	}
 
-	private destroyItem(entry: ClipboardEntry, item: ClipboardItem): void {
+	private destroyWidget(entry: ClipboardEntry, widget: St.Widget): void {
 		this._live.delete(entry);
-		if (item === this._firstItem) this._firstItem = null;
-		if (item === this._lastItem) this._lastItem = null;
-		item.destroy();
+		this._holders.delete(entry);
+		if (widget === this._firstWidget) this._firstWidget = null;
+		if (widget === this._lastWidget) this._lastWidget = null;
+		widget.destroy();
 	}
 
 	/**
 	 * Only the first widget has the first-child pseudo-class. Only the last widget of the *complete* list has the
 	 * last-child pseudo-class, otherwise the end margin of the theme would show up in the middle of the list.
-	 * Only changes pseudo-classes that differ, since every change restyles and relayouts the item.
+	 * Only changes pseudo-classes that differ, since every change restyles and relayouts the widget.
 	 */
 	private updateEdges(): void {
-		const complete = this._shown >= this._filtered.length;
-		const first = this._shown > 0 ? (this._live.get(this._filtered[0]!) ?? null) : null;
-		const last = this._shown > 0 && complete ? (this._live.get(this._filtered[this._shown - 1]!) ?? null) : null;
+		const complete = this._count >= this._filtered.length;
+		const first = this._count > 0 ? this.widgetAt(0) : null;
+		const last = this._count > 0 && complete ? this.widgetAt(this._count - 1) : null;
 
-		if (first !== this._firstItem) {
-			this._firstItem?.remove_style_pseudo_class('first-child');
+		if (first !== this._firstWidget) {
+			this._firstWidget?.remove_style_pseudo_class('first-child');
 			first?.add_style_pseudo_class('first-child');
-			this._firstItem = first;
+			this._firstWidget = first;
 		}
 
-		if (last !== this._lastItem) {
-			this._lastItem?.remove_style_pseudo_class('last-child');
+		if (last !== this._lastWidget) {
+			this._lastWidget?.remove_style_pseudo_class('last-child');
 			last?.add_style_pseudo_class('last-child');
-			this._lastItem = last;
+			this._lastWidget = last;
 		}
 	}
 
+	private widgetAt(index: number): St.Widget | null {
+		const entry = this._filtered[index];
+		return entry ? (this._live.get(entry) ?? this._holders.get(entry) ?? null) : null;
+	}
+
 	private updateStatus(): void {
-		if (this._shown === 0) {
+		if (this._count === 0) {
 			this.add_child(this._statusItem);
 			this.x_align = Clutter.ActorAlign.CENTER;
 			this.x_expand = true;
@@ -387,7 +394,7 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 	 * the pump, it only keeps it at the background budget until the range is up to date.
 	 */
 	private isUrgent(): boolean {
-		if (this._shown >= this._filtered.length) return false;
+		if (this._count >= this._filtered.length) return false;
 
 		const adjustment = this.adjustment;
 		if (adjustment.page_size <= 0) return false;
@@ -405,7 +412,7 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 	 * event. At most one is pending. A pending background slice is replaced when scrolling makes it urgent.
 	 */
 	private schedulePump(): void {
-		if (!this._filling || this._shown >= this._filtered.length) return;
+		if (!this._filling || this._count >= this._filtered.length) return;
 
 		const urgent = this.isUrgent();
 		if (this._pumpId !== 0) {
@@ -422,7 +429,7 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 	}
 
 	private pump(): void {
-		if (this._shown >= this._filtered.length) return;
+		if (this._count >= this._filtered.length) return;
 
 		const budget = this.isUrgent() ? URGENT_BUDGET_US : BACKGROUND_BUDGET_US;
 		this.extend(this._filtered.length, GLib.get_monotonic_time() + budget);
@@ -458,7 +465,7 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 		const index = this._indexOf.get(entry);
 		if (index === undefined) return;
 
-		const created = index >= this._shown;
+		const created = index >= this._count;
 		this.extend(index + 1);
 		const item = this._live.get(entry);
 		if (!item) return;
