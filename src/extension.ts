@@ -12,6 +12,7 @@ import { ClipboardHistory, CopyousSettings, migrateSettings } from './lib/common
 import { SoundManager, tryCreateSoundManager } from './lib/common/sound.js';
 import { ClipboardEntry } from './lib/database/database.js';
 import { ClipboardEntryTracker } from './lib/database/entryTracker.js';
+import { clearAsyncCaches } from './lib/misc/asyncCache.js';
 import { ClipboardManager } from './lib/misc/clipboard.js';
 import { MediaProbe } from './lib/misc/mediaProbe.js';
 import { NotificationManager } from './lib/misc/notifications.js';
@@ -301,6 +302,9 @@ export default class CopyousExtension extends Extension {
 		this.indicator?.destroy();
 		this.clipboardDialog = undefined;
 		this.indicator = undefined;
+
+		// Deferred work and caches shared by the items (images of links, highlighted code)
+		clearAsyncCaches();
 
 		// Highlight.js
 		this.hljs = undefined;

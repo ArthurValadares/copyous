@@ -12,6 +12,7 @@ import { enumParamSpec, flagsParamSpec, registerClass } from '../../common/gjs.j
 import { Icon } from '../../common/icons.js';
 import { BackgroundSize, LinkItemSettings } from '../../common/settings.js';
 import { ClipboardEntry, LinkMetadata } from '../../database/database.js';
+import { AsyncCache } from '../../misc/asyncCache.js';
 import { tryGetLinkImage, tryGetMetadata } from '../../misc/link.js';
 import { ImagePreview } from '../components/contentPreview.js';
 import { SearchQuery } from '../searchEntry.js';
@@ -19,6 +20,12 @@ import { ClipboardItem } from './clipboardItem.js';
 
 const SPACING = 3;
 const IMAGE_SPACING = 6;
+
+/**
+ * Link preview images by image URL, shared by all items. Items are destroyed and created again while scrolling,
+ * and the image should not be fetched again each time.
+ */
+const linkImageCache = new AsyncCache<string, Awaited<ReturnType<typeof tryGetLinkImage>>>(64);
 
 @registerClass({
 	Properties: {
@@ -152,7 +159,10 @@ export class LinkPreview extends St.Widget {
 		} else if (this._image === undefined && this._metadata?.image && this._showImage) {
 			this._image = null;
 
-			tryGetLinkImage(this.ext, this._metadata.image, this._cancellable)
+			// The load is shared and cached, and is not cancelled when this widget is destroyed
+			const imageUrl = this._metadata.image;
+			linkImageCache
+				.load(imageUrl, (cancellable) => tryGetLinkImage(this.ext, imageUrl, cancellable))
 				.then((image) => {
 					if (this._cancellable.is_cancelled()) return;
 
@@ -165,7 +175,10 @@ export class LinkPreview extends St.Widget {
 						this._image = null;
 					}
 				})
-				.catch(() => {});
+				.catch(() => {
+					// A failed load is not cached, so the next item may try again
+					if (!this._cancellable.is_cancelled()) this._image = null;
+				});
 		}
 
 		this._title.visible = this._metadata?.title != null || this._metadata?.description != null;
