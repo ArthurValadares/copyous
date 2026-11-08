@@ -93,6 +93,8 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 		this._ext.settings.connectObject(
 			'changed::item-width', () => this.resizeHolders(),
 			'changed::item-height', () => this.resizeHolders(),
+			'changed::dynamic-item-height', () => this.rebuild(),
+			'changed::clipboard-orientation', () => this.rebuild(),
 			this);
 	}
 
@@ -260,6 +262,19 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 		const height = this._ext.settings.get_int('item-height');
 		for (const holder of this._holders.values()) holder.set_size(width, height);
 		this.schedulePump();
+	}
+
+	/** Destroys every widget and builds them again, for when the kind of layout changes. */
+	private rebuild(): void {
+		for (const item of this._live.values()) item.destroy();
+		for (const holder of this._holders.values()) holder.destroy();
+		this._live.clear();
+		this._holders.clear();
+		this._firstWidget = null;
+		this._lastWidget = null;
+		this._count = 0;
+		this._fixed = this.isFixed();
+		this.refresh();
 	}
 
 	/**
