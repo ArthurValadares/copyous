@@ -300,7 +300,7 @@ export class LinkItem extends ClipboardItem {
 	private readonly linkItemSettings: LinkItemSettings;
 
 	private readonly _linkPreview: LinkPreview;
-	private readonly _url: St.Label;
+	private _url?: St.Label; // Only needed while the preview is hidden, so it is created on demand
 
 	private readonly _cancellable: Gio.Cancellable = new Gio.Cancellable();
 
@@ -313,11 +313,6 @@ export class LinkItem extends ClipboardItem {
 
 		this._linkPreview = new LinkPreview(ext, this.entry.content.trim());
 		this._content.add_child(this._linkPreview);
-
-		this._url = new St.Label({ style_class: 'link-url', text: this.entry.content.trim() });
-		this._url.clutter_text.line_wrap = true;
-		this._url.clutter_text.line_wrap_mode = Pango.WrapMode.WORD_CHAR;
-		this._content.add_child(this._url);
 
 		// Bind properties
 		this.linkItemSettings.connectObject('changed', this.updateLinkPreview.bind(this), this);
@@ -362,7 +357,14 @@ export class LinkItem extends ClipboardItem {
 		this._linkPreview.backgroundSize = backgroundSize;
 		this._linkPreview.orientation = orientation;
 		this._linkPreview.topPadding = !showHeader;
-		this._url.visible = !show;
+
+		if (!show && !this._url) {
+			this._url = new St.Label({ style_class: 'link-url', text: url });
+			this._url.clutter_text.line_wrap = true;
+			this._url.clutter_text.line_wrap_mode = Pango.WrapMode.WORD_CHAR;
+			this._content.add_child(this._url);
+		}
+		if (this._url) this._url.visible = !show;
 
 		if (this.entry.metadata) {
 			const metadata: LinkMetadata = { title: null, description: null, image: null, ...this.entry.metadata };
