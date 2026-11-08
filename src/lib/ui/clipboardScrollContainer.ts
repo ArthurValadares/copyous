@@ -12,31 +12,38 @@ import { SearchChange, SearchQuery } from './searchEntry.js';
 /** Number of widgets created synchronously whenever the list is rebuilt. */
 const INITIAL = 20;
 
-/** Widgets are created at least this many pages ahead of the visible area while scrolling. */
+/** Items are realized this many pages before and after the visible area (fixed item size). */
+const OVERSCAN_PAGES = 1;
+
+/** Realized items are only released when they are further than this many pages from the visible area. */
+const KEEP_PAGES = 2;
+
+/** Widgets are created at least this many pages ahead of the visible area while scrolling (dynamic item size). */
 const AHEAD_PAGES = 3;
 
-/** Time budget (µs) of one slice of widget creation when the scroll position is close to the last created widget. */
+/** Time budget (µs) of one slice of widget creation when the scroll position is close to what is missing. */
 const URGENT_BUDGET_US = 8000;
 
-/** Time budget (µs) of one slice of widget creation when filling the list in the background. */
+/** Time budget (µs) of one slice of widget creation when nothing visible is missing. */
 const BACKGROUND_BUDGET_US = 3000;
 
 /** Creates the widget for an entry. Returns null if the entry cannot be displayed. */
 export type ClipboardItemFactory = (entry: ClipboardEntry) => ClipboardItem | null;
 
 /**
- * A scrollable list of clipboard items that creates its widgets progressively.
+ * A scrollable list of clipboard items with placeholders.
  *
- * All entries (the model) are always kept in memory, but a ClipboardItem is only created for the first `_count`
- * entries that match the search. Position, spacing and size of the widgets are entirely handled by the
- * St.BoxLayout: nothing here depends on the item size, the orientation, the text direction or the margins defined
- * by the theme.
+ * All entries (the model) are always kept in memory. The layout is entirely done by the St.BoxLayout, so nothing
+ * here depends on the orientation, the text direction, the spacing or the margins defined by the theme:
  *
- * Widgets are created by a single "pump", in slices limited by a time budget so that no frame is blocked for long:
- * - The first INITIAL widgets are created synchronously (when the list changes), so the dialog opens quickly.
- * - After the dialog has been opened once, the rest is created in the background, in small slices at low priority.
- * - When the scroll position gets within AHEAD_PAGES pages of the last created widget, the pump runs at a higher
- *   priority and with a larger budget, so it stays ahead of the scrolling.
+ * - Fixed item size (the default): every matching entry has a child. Entries near the visible area have a real
+ *   ClipboardItem ("realized"), all the others have a cheap placeholder of exactly the same size and style. The
+ *   scroll range is correct from the start and there are no spacers to keep in sync. Items far from the visible
+ *   area are turned back into placeholders (with hysteresis, so scrolling back and forth does not rebuild them).
+ * - Dynamic item height (vertical only): the size of an item depends on its content, so a placeholder cannot
+ *   have the right size. The list then creates real items progressively and never releases them.
+ *
+ * Widgets are created by a single "pump", in slices limited by a time budget so that no frame is blocked for long.
  */
 @registerClass()
 export class ClipboardScrollContainer extends St.BoxLayout {
@@ -54,11 +61,12 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 	private readonly _live = new Map<ClipboardEntry, ClipboardItem>();
 	private readonly _holders = new Map<ClipboardEntry, St.Widget>();
 	private _count: number = 0;
+	private _fixed: boolean = true; // whether placeholders are used (fixed item size)
 	private _firstWidget: St.Widget | null = null; // the only widget with the first-child pseudo-class
 	private _lastWidget: St.Widget | null = null; // the only widget with the last-child pseudo-class
 
 	// Pump
-	private _filling: boolean = false; // whether the list is completed in the background
+	private _filling: boolean = false; // whether the dialog has been mapped, so that the pump may run
 	private _pumpId: number = 0;
 	private _pumpUrgent: boolean = false;
 	private _settleUpper: number | null = null; // scroll range at the time widgets were created, until it is laid out
@@ -67,14 +75,15 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 	private _lastFocus: ClipboardEntry | null = null;
 	private _lastQuery: SearchQuery | null = null;
 
-	constructor(ext: CopyousExtension) {
+	constructor(private readonly _ext: CopyousExtension) {
 		super({
 			style_class: 'clipboard-item-list',
 			x_align: Clutter.ActorAlign.START,
 			x_expand: false,
 		});
 
-		this._statusItem = new StatusItem(ext);
+		this._statusItem = new StatusItem(_ext);
+		this._fixed = this.isFixed();
 		this.refresh();
 
 		// The scroll direction changes the adjustment that has to be watched
@@ -219,27 +228,54 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 	// Widgets
 	// ---------------------------------------------------------------------------------------------------------------
 
+	/** Placeholders are only possible when every item has the same, known size. */
+	private isFixed(): boolean {
+		const dynamicHeight = this._ext.settings.get_boolean('dynamic-item-height');
+		const orientation: Clutter.Orientation = this._ext.settings.get_enum('clipboard-orientation');
+		return !(dynamicHeight && orientation === Clutter.Orientation.VERTICAL);
+	}
+
+	/**
+	 * A placeholder has the style class of an item (so margins, borders and spacing from the theme are identical)
+	 * and the size of an item. It paints the same background, which is what shows while scrolling quickly.
+	 */
+	private createHolder(): St.Widget {
+		return new St.Widget({
+			style_class: 'clipboard-item clipboard-item-placeholder',
+			x_expand: false,
+			y_expand: false,
+			width: this._ext.settings.get_int('item-width'),
+			height: this._ext.settings.get_int('item-height'),
+		});
+	}
+
 	/**
 	 * Recomputes the matching entries from the model and brings the widgets up to date.
 	 *
-	 * The window of widgets is the first INITIAL entries, the run of widgets that already exist right after them
-	 * (so a more specific search or a new entry does not rebuild widgets that still fit) and the focused entry.
-	 * Widgets outside of the window are destroyed, missing widgets inside of it are created synchronously.
+	 * Fixed item size: every matching entry gets a widget. The first INITIAL entries and the focused entry are
+	 * real items, the others placeholders, and the pump realizes what is near the visible area.
+	 * Dynamic item size: the widgets are the first INITIAL entries, the run of real items that already exist
+	 * right after them (so a more specific search or a new entry does not rebuild items that still fit) and the
+	 * focused entry.
 	 */
 	private refresh(): void {
 		const focused = this.focusedEntry();
 
+		this._fixed = this.isFixed();
 		this._filtered = this._entries.filter((e) => this._matched.get(e) !== false);
 		this._indexOf.clear();
 		this._filtered.forEach((e, i) => this._indexOf.set(e, i));
 
 		const n = this._filtered.length;
-		let limit = Math.min(INITIAL, n);
-		while (limit < n && this._live.has(this._filtered[limit]!)) limit++;
+		let limit = n;
+		if (!this._fixed) {
+			limit = Math.min(INITIAL, n);
+			while (limit < n && this._live.has(this._filtered[limit]!)) limit++;
 
-		// The focused item (e.g. while editing its title) must keep existing
-		const focusIndex = focused !== null ? this._indexOf.get(focused) : undefined;
-		if (focusIndex !== undefined) limit = Math.max(limit, focusIndex + 1);
+			// The focused item (e.g. while editing its title) must keep existing
+			const focusIndex = focused !== null ? this._indexOf.get(focused) : undefined;
+			if (focusIndex !== undefined) limit = Math.max(limit, focusIndex + 1);
+		}
 
 		const wanted = this._filtered.slice(0, limit);
 		const wantedSet = new Set(wanted);
@@ -247,26 +283,37 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 		for (const [entry, item] of [...this._live]) {
 			if (!wantedSet.has(entry)) this.destroyWidget(entry, item);
 		}
+		for (const [entry, holder] of [...this._holders]) {
+			if (!wantedSet.has(entry) || (!this._fixed && this._holders.has(entry))) {
+				this.destroyWidget(entry, holder);
+			}
+		}
 
 		if (this._statusItem.get_parent() === this) this.remove_child(this._statusItem);
 
-		const items: ClipboardItem[] = [];
+		const widgets: St.Widget[] = [];
 		const failed: ClipboardEntry[] = [];
 		let created = false;
-		for (const entry of wanted) {
-			let item = this._live.get(entry);
-			if (!item) {
-				const newItem = this.createWidget(entry);
-				if (!newItem) {
-					failed.push(entry);
-					continue;
+		for (const [i, entry] of wanted.entries()) {
+			let widget: St.Widget | undefined = this._live.get(entry) ?? this._holders.get(entry);
+			if (!widget) {
+				if (!this._fixed || i < INITIAL || entry === focused) {
+					const item = this.createWidget(entry);
+					if (!item) {
+						failed.push(entry);
+						continue;
+					}
+					widget = item;
+				} else {
+					const holder = this.createHolder();
+					this._holders.set(entry, holder);
+					widget = holder;
 				}
 
-				item = newItem;
 				created = true;
-				this.add_child(item);
+				this.add_child(widget);
 			}
-			items.push(item);
+			widgets.push(widget);
 		}
 
 		// Entries that could not be turned into a widget are dropped from the model
@@ -277,18 +324,18 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 		}
 
 		// Apply order, only touching children that are not already in place
-		items.forEach((item, i) => {
-			if (this.get_child_at_index(i) !== item) this.set_child_at_index(item, i);
+		widgets.forEach((widget, i) => {
+			if (this.get_child_at_index(i) !== widget) this.set_child_at_index(widget, i);
 		});
 
-		this._count = items.length;
+		this._count = widgets.length;
 		this.updateEdges();
 		this.updateStatus();
-		if (created) this.markPending();
+		if (created && !this._fixed) this.markPending();
 		this.schedulePump();
 	}
 
-	/** Creates the widgets of the next entries, up to `limit` entries in total, stopping once `deadline` is passed. */
+	/** Dynamic item size: creates the widgets of the next entries, up to `limit` in total, until `deadline`. */
 	private extend(limit: number, deadline: number = Infinity): void {
 		limit = Math.min(limit, this._filtered.length);
 
@@ -330,6 +377,51 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 		if (widget === this._firstWidget) this._firstWidget = null;
 		if (widget === this._lastWidget) this._lastWidget = null;
 		widget.destroy();
+	}
+
+	/** Fixed item size: makes sure the entry at `index` has a real item, replacing its placeholder. */
+	private realizeItem(index: number): ClipboardItem | null {
+		const entry = this._filtered[index];
+		if (!entry) return null;
+
+		const existing = this._live.get(entry);
+		if (existing) return existing;
+
+		const holder = this._holders.get(entry);
+		const item = this.createWidget(entry);
+		if (!item) {
+			this.dropEntry(entry);
+			this.refresh();
+			return null;
+		}
+
+		if (holder) this.swapWidget(holder, item, index);
+		else this.add_child(item);
+		this._holders.delete(entry);
+		return item;
+	}
+
+	/** Fixed item size: turns a real item back into a placeholder. */
+	private releaseItem(entry: ClipboardEntry, item: ClipboardItem): void {
+		const index = this._indexOf.get(entry);
+		if (index === undefined) return;
+
+		const holder = this.createHolder();
+		this._holders.set(entry, holder);
+		this._live.delete(entry);
+		this.swapWidget(item, holder, index);
+	}
+
+	/** Puts `next` at the position of `old` and destroys `old`. Both have the same size, so nothing moves. */
+	private swapWidget(old: St.Widget, next: St.Widget, index: number): void {
+		for (const pseudo of ['first-child', 'last-child']) {
+			if (old.has_style_pseudo_class(pseudo)) next.add_style_pseudo_class(pseudo);
+		}
+		if (old === this._firstWidget) this._firstWidget = next;
+		if (old === this._lastWidget) this._lastWidget = next;
+
+		this.insert_child_at_index(next, index);
+		old.destroy();
 	}
 
 	/**
@@ -381,13 +473,13 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 		return this.orientation === Clutter.Orientation.HORIZONTAL ? this.hadjustment : this.vadjustment;
 	}
 
-	/** Remembers that widgets were created whose size is not part of the scroll range yet. */
+	/** Dynamic item size: remembers that widgets were created whose size is not part of the scroll range yet. */
 	private markPending(): void {
 		this._settleUpper = this.adjustment.upper;
 	}
 
 	/**
-	 * Whether the scroll position is within AHEAD_PAGES pages of the last created widget.
+	 * Dynamic item size: whether the scroll position is within AHEAD_PAGES pages of the last created widget.
 	 *
 	 * The scroll range only includes new widgets after the next layout. Until then the range is stale and the
 	 * position would look closer to the end than it is, so the pump is not considered urgent. This never blocks
@@ -408,11 +500,63 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 	}
 
 	/**
+	 * Fixed item size: the indices of the first and last entry that are at least partly visible, from the
+	 * allocation of the first two widgets (all widgets have the same size, so this gives the stride). In RTL the
+	 * horizontal adjustment is mirrored, as in scrollToChild. Null while the layout is not known yet.
+	 */
+	private visibleRange(): [number, number] | null {
+		const adjustment = this.adjustment;
+		const c0 = this.get_child_at_index(0);
+		if (!c0 || this._filtered.length === 0 || adjustment.page_size <= 0) return null;
+
+		const horizontal = this.orientation === Clutter.Orientation.HORIZONTAL;
+		const rtl = horizontal && this.text_direction === Clutter.TextDirection.RTL;
+
+		const startOf = (actor: Clutter.Actor): number => {
+			const box = actor.get_allocation_box();
+			if (!horizontal) return box.y1;
+			return rtl ? adjustment.upper - box.x2 : box.x1;
+		};
+		const sizeOf = (actor: Clutter.Actor): number => {
+			const box = actor.get_allocation_box();
+			return horizontal ? box.get_width() : box.get_height();
+		};
+
+		const size = sizeOf(c0);
+		if (size <= 0) return null;
+
+		const c1 = this._filtered.length > 1 ? this.get_child_at_index(1) : null;
+		const origin = startOf(c0);
+		const stride = c1 ? startOf(c1) - origin : size;
+		if (!(stride > 0)) return null;
+
+		const viewStart = rtl ? adjustment.upper - adjustment.value - adjustment.page_size : adjustment.value;
+		const n = this._filtered.length;
+		const first = Math.min(Math.max(Math.floor((viewStart - origin) / stride), 0), n - 1);
+		const last = Math.min(Math.max(Math.floor((viewStart + adjustment.page_size - origin) / stride), first), n - 1);
+		return [first, last];
+	}
+
+	/**
 	 * Makes sure a slice of widget creation is scheduled, in an idle callback and never inside a scroll or layout
-	 * event. At most one is pending. A pending background slice is replaced when scrolling makes it urgent.
+	 * event. At most one is pending.
 	 */
 	private schedulePump(): void {
-		if (!this._filling || this._count >= this._filtered.length) return;
+		if (!this._filling) return;
+
+		if (this._fixed) {
+			if (this._pumpId !== 0 || this._filtered.length === 0) return;
+
+			this._pumpId = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+				this._pumpId = 0;
+				this.pumpWindow();
+				return GLib.SOURCE_REMOVE;
+			});
+			return;
+		}
+
+		// Dynamic item size. A pending background slice is replaced when scrolling makes it urgent.
+		if (this._count >= this._filtered.length) return;
 
 		const urgent = this.isUrgent();
 		if (this._pumpId !== 0) {
@@ -428,12 +572,64 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 		});
 	}
 
+	/** Dynamic item size: creates the widgets that are missing, in the background. */
 	private pump(): void {
 		if (this._count >= this._filtered.length) return;
 
 		const budget = this.isUrgent() ? URGENT_BUDGET_US : BACKGROUND_BUDGET_US;
 		this.extend(this._filtered.length, GLib.get_monotonic_time() + budget);
 		this.schedulePump();
+	}
+
+	/**
+	 * Fixed item size: realizes the items around the visible area, nearest first, and then releases the items that
+	 * are far away. Only a slice runs at a time, if anything is left the pump schedules itself again.
+	 */
+	private pumpWindow(): void {
+		const range = this.visibleRange();
+		if (range === null) return;
+
+		const n = this._filtered.length;
+		const [first, last] = range;
+		const pages = last - first + 1;
+		const lo = Math.max(first - pages * OVERSCAN_PAGES, 0);
+		const hi = Math.min(last + pages * OVERSCAN_PAGES, n - 1);
+
+		const middle = (first + last) / 2;
+		const missing: number[] = [];
+		for (let i = lo; i <= hi; i++) {
+			if (!this._live.has(this._filtered[i]!)) missing.push(i);
+		}
+		missing.sort((a, b) => Math.abs(a - middle) - Math.abs(b - middle));
+
+		// What is visible is urgent and gets a larger budget
+		const urgent = missing.some((i) => i >= first && i <= last);
+		const deadline = GLib.get_monotonic_time() + (urgent ? URGENT_BUDGET_US : BACKGROUND_BUDGET_US);
+
+		let created = 0;
+		for (const i of missing) {
+			// Always create at least one item, so that every slice makes progress
+			if (created > 0 && GLib.get_monotonic_time() >= deadline) {
+				this.schedulePump();
+				return;
+			}
+
+			// An entry that cannot be displayed is dropped and the list is rebuilt, which schedules the pump
+			if (!this.realizeItem(i)) return;
+			created++;
+		}
+
+		if (created > 0) this.updateEdges();
+
+		// Release the items that are far from the visible area, but never the focused one
+		const keepLo = first - pages * KEEP_PAGES;
+		const keepHi = last + pages * KEEP_PAGES;
+		const focused = this.focusedEntry();
+		for (const [entry, item] of [...this._live]) {
+			const index = this._indexOf.get(entry);
+			if (index === undefined || entry === focused || (index >= keepLo && index <= keepHi)) continue;
+			this.releaseItem(entry, item);
+		}
 	}
 
 	// ---------------------------------------------------------------------------------------------------------------
@@ -460,23 +656,33 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 		}
 	}
 
-	/** Focuses the widget of an entry, creating it (and every widget before it) if necessary. */
+	/** Makes sure the entry at `index` has a real item. In the dynamic mode this creates every item before it. */
+	private ensureRealized(index: number): void {
+		if (this._fixed) this.realizeItem(index);
+		else this.extend(index + 1);
+	}
+
+	/** Focuses the widget of an entry, creating it (and, with dynamic item size, every widget before it). */
 	public focusEntry(entry: ClipboardEntry, animate: boolean = true): void {
 		const index = this._indexOf.get(entry);
 		if (index === undefined) return;
 
-		const created = index >= this._count;
-		this.extend(index + 1);
+		// With fixed item size the scroll range is already complete, only the dynamic mode grows it
+		const grows = !this._fixed && index >= this._count;
+		this.ensureRealized(index);
 		const item = this._live.get(entry);
 		if (!item) return;
 
+		if (this._fixed) this.updateEdges();
+
 		this._lastFocus = entry;
 		item.grab_key_focus();
-		this.scrollToChild(item, animate && !created);
+		this.scrollToChild(item, animate && !grows);
 
 		// Widgets that were just created may not be reflected in the scroll range yet, which would clamp the
 		// scroll position. Scroll again once the layout has settled.
-		if (created) this.scrollAfterLayout(entry);
+		if (grows) this.scrollAfterLayout(entry);
+		this.schedulePump();
 	}
 
 	private scrollAfterLayout(entry: ClipboardEntry): void {
@@ -495,7 +701,7 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 		if (entry) this.focusEntry(entry);
 	}
 
-	/** Creates a widget for every entry that matches, so this is the one operation that scales with the history. */
+	/** With fixed item size only the last item is created, with dynamic item size every item is. */
 	public focusLast(): void {
 		const entry = this._filtered[this._filtered.length - 1];
 		if (entry) this.focusEntry(entry);
@@ -615,7 +821,7 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 		const first = this._filtered[0];
 		if (!first) return;
 
-		this.extend(1);
+		this.ensureRealized(0);
 		const item = this._live.get(first);
 		if (item instanceof St.Button) {
 			item.vfunc_clicked(1);
@@ -719,8 +925,8 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 
 		super.vfunc_map();
 
-		// The rest of the list is created in the background from the first time the dialog is opened. Until then
-		// only the initial widgets exist, which keeps the start of the shell light.
+		// The pump runs from the first time the dialog is opened. Until then only the initial widgets are real
+		// items, which keeps the start of the shell light.
 		this._filling = true;
 		this.schedulePump();
 	}
